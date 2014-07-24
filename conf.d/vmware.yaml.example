@@ -1,0 +1,6 @@
+init_config:
+
+instances:
+#    -   host: vcenter.domain.com
+#        username: datadog-readonly@domain
+#        password: mypassword
