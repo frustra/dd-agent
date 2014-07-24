@@ -15,7 +15,7 @@ class VMWareMetric(object):
         self.group = group
         self.counter = counter
         self.tagged = tagged
-    
+
     def get_stat_name(self):
         return "{0}.{1}".format(self.group, self.counter)
 
@@ -44,7 +44,7 @@ class VMWareMetric(object):
                         None
                     ))
 
-        return metrics 
+        return metrics
 
     @classmethod
     def transform_to_datadog(cls, value, unit):
@@ -83,7 +83,7 @@ class VMWare(AgentCheck):
         conn, pm = self._get_conn_pm(instance)
         hostnames = conn.get_hosts()
         hosts = [ VIMor(k, MORTypes.HostSystem) for k in hostnames.keys() ]
-        
+
         vmware_metrics = [
             VMWareMetric('cpu', 'coreUtilization'),
             VMWareMetric('cpu', 'usage'),
@@ -105,7 +105,7 @@ class VMWare(AgentCheck):
 
 
         for h in hosts:
-            dd_metrics = []            
+            dd_metrics = []
 
             statistics = pm.get_entity_statistic(h, [ m.get_stat_name() for m in vmware_metrics])
             for vmware_metric in vmware_metrics:
@@ -117,7 +117,7 @@ class VMWare(AgentCheck):
                     m_tags.append(m_tag)
                 metric_method = getattr(self, m_type)
                 metric_method(m_name, m_value, hostname=hostnames[h], tags=m_tags)
-                
+
 
     def check(self, instance):
         conn, pm = self._get_conn_pm(instance)
