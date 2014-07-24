@@ -13,6 +13,7 @@ pycurl
 pysnmp
 pysnmp-mibs
 pymysql
+pysphere
 pg8000
 ntplib
 httplib2
