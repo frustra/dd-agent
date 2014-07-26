@@ -1,4 +1,4 @@
-#!/opt/datadog-agent/embedded/bin/python
+#!/usr/bin/env python
 '''
     Datadog
     www.datadoghq.com
