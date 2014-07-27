@@ -22,10 +22,10 @@ class Varnish(AgentCheck):
         if name == "stat":
             m_name = self.normalize(self._current_metric)
             if self._current_type in ("a", "c"):
-                self.gauge(m_name, long(self._current_value))
-                self.rate(m_name + ".rate", long(self._current_value))
+                self._metrics[m_name] = self._metrics.get(m_name, 0) + long(self._current_value)
+                self._metrics[m_name + ".rate"] = self._metrics.get(m_name + ".rate", 0) + long(self._current_value)
             elif self._current_type in ("i", "g"):
-                self.gauge(m_name, long(self._current_value))
+                self._metrics[m_name] = self._metrics.get(m_name, 0) + long(self._current_value)
             else:
                 # Unsupported data type, ignore
                 self._reset()
@@ -33,8 +33,10 @@ class Varnish(AgentCheck):
 
             # reset for next stat element
             self._reset()
-        elif name in ("type", "ident", "name"):
+        elif name in ("type", "name"):
             self._current_metric += "." + self._current_str
+        elif name == "ident":
+            self._current_metric += "." + self._current_str.split('(', 1)[0]
 
     def _char_data(self, data):
         self.log.debug("Data %s [%s]" % (data, self._current_element))
@@ -146,7 +148,14 @@ class Varnish(AgentCheck):
             p.EndElementHandler = self._end_element
             p.CharacterDataHandler = self._char_data
             self._reset()
+            self._metrics = {}
             p.Parse(output, True)
+            for metric in self._metrics.keys():
+                value = self._metrics[metric]
+                if metric.endswith('.rate'):
+                    self.rate(metric, value)
+                else:
+                    self.gauge(metric, value)
         else:
             for line in output.split("\n"):
                 self.log.debug("Parsing varnish results: %s" % line)
@@ -166,4 +175,3 @@ class Varnish(AgentCheck):
                     self.log.debug("Varnish (rate) %s %d" % (metric_name, int(gauge_val)))
                     self.rate(metric_name, float(gauge_val), tags=tags)
 
-   
