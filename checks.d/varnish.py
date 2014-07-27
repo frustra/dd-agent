@@ -22,7 +22,8 @@ class Varnish(AgentCheck):
         if name == "stat":
             m_name = self.normalize(self._current_metric)
             if self._current_type in ("a", "c"):
-                self.rate(m_name, long(self._current_value))
+                self.gauge(m_name, long(self._current_value))
+                self.count(m_name + ".count", long(self._current_value))
             elif self._current_type in ("i", "g"):
                 self.gauge(m_name, long(self._current_value))
             else:
