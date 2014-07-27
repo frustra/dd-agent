@@ -553,10 +553,13 @@ class MetricsBucketAggregator(Aggregator):
         self.last_flush_cutoff_time = 0
         self.metric_type_to_class = {
             'g': BucketGauge,
+            'ct': Count,
+            'ct-c': MonotonicCount,
             'c': Counter,
             'h': Histogram,
             'ms': Histogram,
             's': Set,
+            '_dd-r': Rate,
         }
 
     def calculate_bucket_start(self, timestamp):
