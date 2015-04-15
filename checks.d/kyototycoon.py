@@ -1,10 +1,12 @@
 # stdlib
 import re
-import urllib2
 from collections import defaultdict
 
 # project
 from checks import AgentCheck
+
+# 3rd party
+import requests
 
 db_stats = re.compile(r'^db_(\d)+$')
 whitespace = re.compile(r'\s')
@@ -14,6 +16,7 @@ class KyotoTycoonCheck(AgentCheck):
     database server (http://fallabs.com/kyototycoon/)
     """
     SOURCE_TYPE_NAME = 'kyoto tycoon'
+    SERVICE_CHECK_NAME = 'kyototycoon.can_connect'
 
     GAUGES = {
         'repl_delay':         'replication.delay',
@@ -56,11 +59,30 @@ class KyotoTycoonCheck(AgentCheck):
         if name is not None:
             tags.append('instance:%s' % name)
 
-        response = urllib2.urlopen(url)
-        body = response.read()
+        service_check_tags = []
+        if name is not None:
+            service_check_tags.append('instance:%s' % name)
 
-        totals = defaultdict(lambda: 0)
-        for line in body.split('\n'):
+
+        try:
+            r = requests.get(url)
+            r.raise_for_status()
+        except requests.exceptions.HTTPError as e:
+            self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.CRITICAL,
+                tags=service_check_tags, message=str(e.message))
+            raise
+        except Exception as e:
+            self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.CRITICAL,
+                tags=service_check_tags, message=str(e))
+            raise
+        else:
+            self.service_check(self.SERVICE_CHECK_NAME, AgentCheck.OK,
+                tags=service_check_tags)
+
+        body = r.content
+
+        totals = defaultdict(int)
+        for line in body.splitlines():
             if '\t' not in line:
                 continue
 

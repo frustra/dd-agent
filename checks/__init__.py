@@ -286,10 +286,16 @@ class AgentCheck(object):
         self.name = name
         self.init_config = init_config or {}
         self.agentConfig = agentConfig
-        self.hostname = get_hostname(agentConfig)
+        self.hostname = agentConfig.get('checksd_hostname') or get_hostname(agentConfig)
         self.log = logging.getLogger('%s.%s' % (__name__, name))
 
-        self.aggregator = MetricsAggregator(self.hostname, formatter=agent_formatter, recent_point_threshold=agentConfig.get('recent_point_threshold', None))
+        self.aggregator = MetricsAggregator(
+            self.hostname,
+            formatter=agent_formatter,
+            recent_point_threshold=agentConfig.get('recent_point_threshold', None),
+            histogram_aggregates=agentConfig.get('histogram_aggregates'),
+            histogram_percentiles=agentConfig.get('histogram_percentiles')
+        )
 
         self.events = []
         self.service_checks = []
@@ -502,7 +508,7 @@ class AgentCheck(object):
         """ Add a warning message that will be printed in the info page
         :param warning_message: String. Warning message to be displayed
         """
-        self.warnings.append(warning_message)
+        self.warnings.append(str(warning_message))
 
     def get_library_info(self):
         if self.library_versions is not None:
@@ -530,7 +536,7 @@ class AgentCheck(object):
         instance_statuses = []
         for i, instance in enumerate(self.instances):
             try:
-                min_collection_interval = instance.get('min_collection_interval', 
+                min_collection_interval = instance.get('min_collection_interval',
                     self.init_config.get('min_collection_interval', self.DEFAULT_MIN_COLLECTION_INTERVAL))
                 now = time.time()
                 if now - self.last_collection_time[i] < min_collection_interval:
@@ -550,7 +556,7 @@ class AgentCheck(object):
                 self.log.exception("Check '%s' instance #%s failed" % (self.name, i))
                 instance_status = check_status.InstanceStatus(i,
                     check_status.STATUS_ERROR,
-                    error=e,
+                    error=str(e),
                     tb=traceback.format_exc()
                 )
             instance_statuses.append(instance_status)
@@ -586,8 +592,12 @@ class AgentCheck(object):
             f.close()
 
         config = yaml.load(yaml_text, Loader=yLoader)
-        check = cls(check_name, config.get('init_config') or {}, agentConfig or {})
-
+        try:
+            check = cls(check_name, config.get('init_config') or {}, agentConfig or {},
+                        config.get('instances'))
+        except TypeError:
+            # Compatibility for the check not supporting instances
+            check = cls(check_name, config.get('init_config') or {}, agentConfig or {})
         return check, config.get('instances', [])
 
     def normalize(self, metric, prefix=None, fix_case = False):

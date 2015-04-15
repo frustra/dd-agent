@@ -1,135 +1,176 @@
-import unittest
-import subprocess
-import time
-import urllib2
-import tempfile
-import os
-import logging
-
-from util import get_hostname
-from tests.common import load_check, kill_subprocess
+from checks import AgentCheck
 from nose.plugins.attrib import attr
-logging.basicConfig()
+from tests.common import AgentCheckTest
+from util import get_hostname
 
-MAX_WAIT = 30
-HAPROXY_CFG = os.path.realpath(os.path.join(os.path.dirname(__file__), "haproxy.cfg"))
-HAPROXY_OPEN_CFG = os.path.realpath(os.path.join(os.path.dirname(__file__), "haproxy-open.cfg"))
 
-@attr('haproxy')
-class HaproxyTestCase(unittest.TestCase):
-    def _wait(self, url):
-        loop = 0
-        while True:
-            try:
-                STATS_URL = ";csv;norefresh"
-                passman = urllib2.HTTPPasswordMgrWithDefaultRealm()
-                passman.add_password(None, url, "datadog", "isdevops")
-                authhandler = urllib2.HTTPBasicAuthHandler(passman)
-                opener = urllib2.build_opener(authhandler)
-                urllib2.install_opener(opener)
-                url = "%s%s" % (url,STATS_URL)
-                req = urllib2.Request(url)
-                request = urllib2.urlopen(req)
-                break
-            except Exception:
-                time.sleep(0.5)
-                loop+=1
-                if loop >= MAX_WAIT:
-                    break
+@attr(requires='haproxy')
+class HaproxyTest(AgentCheckTest):
+    CHECK_NAME = 'haproxy'
 
-    def start_server(self, config_fn, config):
-        self.agentConfig = {
-            'version': '0.1',
-            'api_key': 'toto'
-        }
+    BACKEND_SERVICES = ['anotherbackend', 'datadog']
 
-        # Initialize the check from checks.d
-        self.check = load_check('haproxy', config, self.agentConfig)
+    BACKEND_LIST = ['singleton:8080', 'singleton:8081', 'otherserver']
 
-        self.process = None
-        try:
-            self.cfg = tempfile.NamedTemporaryFile()
-            self.cfg.write(open(config_fn).read())
-            self.cfg.flush()
-            # Start haproxy
-            self.process = subprocess.Popen(["haproxy","-d", "-f", self.cfg.name],
-                        executable="haproxy",
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE)
+    FRONTEND_CHECK_GAUGES = [
+        'haproxy.frontend.requests.rate',
+        'haproxy.frontend.session.current',
+        'haproxy.frontend.session.limit',
+        'haproxy.frontend.session.pct',
+    ]
 
-            # Wait for it to really start
-            self._wait("http://localhost:3834/stats")
-        except Exception:
-            logging.getLogger().exception("Cannot instantiate haproxy")
+    BACKEND_CHECK_GAUGES = [
+        'haproxy.backend.queue.current',
+        'haproxy.backend.session.current',
+    ]
 
-    def testCheck(self):
-        config = {
-            'init_config': {},
-            'instances': [{
-                'url': 'http://localhost:3834/stats',
+    FRONTEND_CHECK_RATES = [
+        'haproxy.frontend.bytes.in_rate',
+        'haproxy.frontend.bytes.out_rate',
+        'haproxy.frontend.denied.req_rate',
+        'haproxy.frontend.denied.resp_rate',
+        'haproxy.frontend.errors.req_rate',
+        'haproxy.frontend.response.1xx',
+        'haproxy.frontend.response.2xx',
+        'haproxy.frontend.response.3xx',
+        'haproxy.frontend.response.4xx',
+        'haproxy.frontend.response.5xx',
+        'haproxy.frontend.response.other',
+        'haproxy.frontend.session.rate',
+    ]
+
+    BACKEND_CHECK_RATES = [
+        'haproxy.backend.bytes.in_rate',
+        'haproxy.backend.bytes.out_rate',
+        'haproxy.backend.denied.resp_rate',
+        'haproxy.backend.errors.con_rate',
+        'haproxy.backend.errors.resp_rate',
+        'haproxy.backend.response.1xx',
+        'haproxy.backend.response.2xx',
+        'haproxy.backend.response.3xx',
+        'haproxy.backend.response.4xx',
+        'haproxy.backend.response.5xx',
+        'haproxy.backend.response.other',
+        'haproxy.backend.session.rate',
+        'haproxy.backend.warnings.redis_rate',
+        'haproxy.backend.warnings.retr_rate',
+    ]
+
+    def __init__(self, *args, **kwargs):
+        AgentCheckTest.__init__(self, *args, **kwargs)
+        self.config = {
+            "instances": [{
+                'url': 'http://localhost:3835/stats',
                 'username': 'datadog',
                 'password': 'isdevops',
                 'status_check': True,
                 'collect_aggregates_only': False,
+                'tag_service_check_by_host': True,
             }]
         }
-        self.start_server(HAPROXY_CFG, config)
+        self.config_open = {
+            'instances': [{
+                'url': 'http://localhost:3836/stats',
+                'collect_aggregates_only': False,
+            }]
+        }
 
-        # Run the check against our running server
-        self.check.check(config['instances'][0])
-        # Sleep for 1 second so the rate interval >=1
-        time.sleep(1)
-        # Run the check again so we get the rates
-        self.check.check(config['instances'][0])
+    def _test_frontend_metrics(self, shared_tag):
+        frontend_tags = shared_tag + ['type:FRONTEND', 'service:public']
+        for gauge in self.FRONTEND_CHECK_GAUGES:
+            self.assertMetric(gauge, tags=frontend_tags, count=1)
 
-        # Metric assertions
-        metrics = self.check.get_metrics()
-        assert metrics
-        self.assertTrue(type(metrics) == type([]))
-        self.assertTrue(len(metrics) > 0)
-        service_checks = self.check.get_service_checks()
-        assert service_checks
-        self.assertTrue(type(service_checks) == type([]))
-        self.assertTrue(len(service_checks) > 0)
+        for rate in self.FRONTEND_CHECK_RATES:
+            self.assertMetric(rate, tags=frontend_tags, count=1)
 
-        self.assertEquals(len([t for t in metrics
-            if t[0] == "haproxy.backend.bytes.in_rate"]), 3, metrics)
-        self.assertEquals(len([t for t in metrics
-            if t[0] == "haproxy.frontend.session.current"]), 1, metrics)
+    def _test_backend_metrics(self, shared_tag, services=None):
+        backend_tags = shared_tag + ['type:BACKEND']
+        if not services:
+            services = self.BACKEND_SERVICES
+        for service in services:
+            for backend in self.BACKEND_LIST:
+                tags = backend_tags + ['service:' + service, 'backend:' + backend]
+                for gauge in self.BACKEND_CHECK_GAUGES:
+                    self.assertMetric(gauge, tags=tags, count=1)
+                for rate in self.BACKEND_CHECK_RATES:
+                    self.assertMetric(rate, tags=tags, count=1)
+
+    def _test_service_checks(self, services=None):
+        if not services:
+            services = self.BACKEND_SERVICES
+        for service in services:
+            for backend in self.BACKEND_LIST:
+                tags = ['service:' + service, 'backend:' + backend]
+                self.assertServiceCheck(self.check.SERVICE_CHECK_NAME,
+                                        status=AgentCheck.UNKNOWN,
+                                        count=1,
+                                        tags=tags)
+            tags = ['service:' + service, 'backend:BACKEND']
+            self.assertServiceCheck(self.check.SERVICE_CHECK_NAME,
+                                    status=AgentCheck.OK,
+                                    count=1,
+                                    tags=tags)
+
+    def test_check(self):
+        self.run_check_twice(self.config)
+
+        shared_tag = ['instance_url:http://localhost:3835/stats']
+
+        self._test_frontend_metrics(shared_tag)
+        self._test_backend_metrics(shared_tag)
+
         # check was run 2 times
         #       - FRONTEND is reporting OPEN that we ignore
         #       - only the BACKEND aggregate is reporting UP -> OK
         #       - The 3 individual servers are returning no check -> UNKNOWN
-        self.assertEquals(len([t for t in service_checks
-            if t['status']== 0]), 2, service_checks)
-        self.assertEquals(len([t for t in service_checks
-            if t['status']== 3]), 6, service_checks)
+        self._test_service_checks()
 
-        inst = config['instances'][0]
-        data = self.check._fetch_data(inst['url'], inst['username'], inst['password'])
-        new_data = [l.replace("no check", "UP") for l in data]
-        self.check._process_data(new_data, False, True, inst['url']),
+        # Make sure the service checks aren't tagged with an empty hostname.
+        self.assertEquals(self.service_checks[0]['host_name'], get_hostname())
 
-        assert self.check.has_events()
-        assert len(self.check.get_events()) == 3 # The 3 individual backend servers were switched to UP
-        service_checks = self.check.get_service_checks()
-        # The 3 servers + the backend aggregate are reporting UP
-        self.assertEquals(len([t for t in service_checks
-            if t['status'] == 0]), 4, service_checks)
+        self.coverage_report()
 
-    def testCountPerStatuses(self):
-        try:
-            from collections import defaultdict
-        except ImportError:
-            from compat.defaultdict import defaultdict
-        config = { # won't be used but still needs to be valid
-            'init_config': {},
-            'instances': [{
-                'url': 'http://localhost:3834/stats',
-                'collect_aggregates_only': False,
-            }]
-        }
-        self.start_server(HAPROXY_OPEN_CFG, config)
+    def test_check_service_filter(self):
+        config = self.config
+        config['instances'][0]['services_include'] = ['datadog']
+        config['instances'][0]['services_exclude'] = ['.*']
+        self.run_check_twice(config)
+        shared_tag = ['instance_url:http://localhost:3835/stats']
+
+        self._test_backend_metrics(shared_tag, ['datadog'])
+
+        self._test_service_checks(['datadog'])
+
+        self.coverage_report()
+
+    def test_wrong_config(self):
+        config = self.config
+        config['instances'][0]['username'] = 'fake_username'
+
+        self.assertRaises(Exception, lambda: self.run_check(config))
+
+        # Test that nothing has been emitted
+        self.coverage_report()
+
+    def test_open_config(self):
+        self.run_check_twice(self.config_open)
+
+        shared_tag = ['instance_url:http://localhost:3836/stats']
+
+        self._test_frontend_metrics(shared_tag)
+        self._test_backend_metrics(shared_tag)
+        self._test_service_checks()
+
+        # This time, make sure the hostname is empty
+        self.assertEquals(self.service_checks[0]['host_name'], '')
+
+        self.coverage_report()
+
+    # Keeping a mocked test since it tests the internal
+    # process of service checks
+    def test_count_per_statuses(self):
+        from collections import defaultdict
+        self.run_check(self.config)
 
         data = """# pxname,svname,qcur,qmax,scur,smax,slim,stot,bin,bout,dreq,dresp,ereq,econ,eresp,wretr,wredis,status,weight,act,bck,chkfail,chkdown,lastchg,downtime,qlimit,pid,iid,sid,throttle,lbtot,tracked,type,rate,rate_lim,rate_max,check_status,check_code,check_duration,hrsp_1xx,hrsp_2xx,hrsp_3xx,hrsp_4xx,hrsp_5xx,hrsp_other,hanafail,req_rate,req_rate_max,req_tot,cli_abrt,srv_abrt,
 a,FRONTEND,,,1,2,12,1,11,11,0,0,0,,,,,OPEN,,,,,,,,,1,1,0,,,,0,1,0,2,,,,0,1,0,0,0,0,,1,1,1,,,
@@ -142,21 +183,23 @@ b,BACKEND,0,0,1,2,0,421,1,0,0,0,,0,0,0,0,UP,6,6,0,,0,1,0,,1,3,0,,421,,1,0,,1,,,,
 """.split('\n')
 
         # per service
-        self.check._process_data(data, True, False, collect_status_metrics=True, collect_status_metrics_by_host=False)
+        self.check._process_data(data, True, False, collect_status_metrics=True,
+                                 collect_status_metrics_by_host=False)
 
         expected_hosts_statuses = defaultdict(int)
         expected_hosts_statuses[('b', 'OPEN')] = 1
-        expected_hosts_statuses[('b', 'UP')] = 4
+        expected_hosts_statuses[('b', 'UP')] = 3
         expected_hosts_statuses[('a', 'OPEN')] = 1
-        expected_hosts_statuses[('a', 'UP')] = 1
         self.assertEquals(self.check.hosts_statuses, expected_hosts_statuses)
 
         # with collect_aggregates_only set to True
-        self.check._process_data(data, True, True, collect_status_metrics=True, collect_status_metrics_by_host=False)
+        self.check._process_data(data, True, True, collect_status_metrics=True,
+                                 collect_status_metrics_by_host=False)
         self.assertEquals(self.check.hosts_statuses, expected_hosts_statuses)
 
         # per host
-        self.check._process_data(data, True, False, collect_status_metrics=True, collect_status_metrics_by_host=True)
+        self.check._process_data(data, True, False, collect_status_metrics=True,
+                                 collect_status_metrics_by_host=True)
         expected_hosts_statuses = defaultdict(int)
         expected_hosts_statuses[('b', 'FRONTEND', 'OPEN')] = 1
         expected_hosts_statuses[('a', 'FRONTEND', 'OPEN')] = 1
@@ -165,66 +208,6 @@ b,BACKEND,0,0,1,2,0,421,1,0,0,0,,0,0,0,0,UP,6,6,0,,0,1,0,,1,3,0,,421,,1,0,,1,,,,
         expected_hosts_statuses[('b', 'i-3', 'UP')] = 1
         self.assertEquals(self.check.hosts_statuses, expected_hosts_statuses)
 
-        self.check._process_data(data, True, True, collect_status_metrics=True, collect_status_metrics_by_host=True)
+        self.check._process_data(data, True, True, collect_status_metrics=True,
+                                 collect_status_metrics_by_host=True)
         self.assertEquals(self.check.hosts_statuses, expected_hosts_statuses)
-
-    def testWrongConfig(self):
-        # Same check, with wrong data
-        config = {
-            'init_config': {},
-            'instances': [{
-                'url': 'http://localhost:3834/stats',
-                'username': 'wrong',
-                'password': 'isdevops',
-                'collect_aggregates_only': False,
-            }]
-        }
-        self.start_server(HAPROXY_CFG, config)
-
-        # Run the check, make sure there are no metrics or events
-        try:
-            self.check.check(config['instances'][0])
-        except Exception:
-            pass
-        else:
-            assert False, "Should raise an error"
-        metrics = self.check.get_metrics()
-        assert len(metrics) == 0
-        assert self.check.has_events() == False
-
-    def testOpenConfig(self):
-        # No passwords this time
-        config = {
-            'init_config': {},
-            'instances': [{
-                'url': 'http://localhost:3834/stats',
-                'collect_aggregates_only': False,
-            }]
-        }
-        self.start_server(HAPROXY_OPEN_CFG, config)
-
-        # Run the check against our running server
-        self.check.check(config['instances'][0])
-        # Sleep for 1 second so the rate interval >=1
-        time.sleep(1)
-        # Run the check again so we get the rates
-        self.check.check(config['instances'][0])
-
-        metrics = self.check.get_metrics()
-        assert metrics
-        self.assertTrue(type(metrics) == type([]))
-        self.assertTrue(len(metrics) > 0)
-
-        self.assertEquals(len([t for t in metrics
-            if t[0] == "haproxy.backend.bytes.in_rate"]), 3, metrics)
-        self.assertEquals(len([t for t in metrics
-            if t[0] == "haproxy.frontend.session.current"]), 1, metrics)
-
-    def tearDown(self):
-        if self.process is not None:
-            kill_subprocess(self.process)
-        del self.cfg
-
-if __name__ == "__main__":
-    unittest.main()
-

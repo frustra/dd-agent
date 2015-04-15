@@ -38,7 +38,7 @@ from tornado.options import define, parse_command_line, options
 # agent import
 from util import Watchdog, get_uuid, get_hostname, json, get_tornado_ioloop
 from emitter import http_emitter
-from config import get_config
+from config import get_config, get_url_endpoint, get_version
 from checks.check_status import ForwarderStatus
 from transaction import Transaction, TransactionManager
 import modules
@@ -53,11 +53,15 @@ except ImportError:
 log = logging.getLogger('forwarder')
 log.setLevel(get_logging_config()['log_level'] or logging.INFO)
 
-PUP_ENDPOINT = "pup_url"
 DD_ENDPOINT  = "dd_url"
 
 TRANSACTION_FLUSH_INTERVAL = 5000 # Every 5 seconds
 WATCHDOG_INTERVAL_MULTIPLIER = 10 # 10x flush interval
+HEADERS_TO_REMOVE = [
+    'Host',
+    'Content-Length',
+]
+
 
 # Maximum delay before replaying a transaction
 MAX_WAIT_FOR_REPLAY = timedelta(seconds=90)
@@ -126,12 +130,14 @@ class EmitterManager(object):
             logging.info('Queueing for emitter %r', emitterThread.name)
             emitterThread.enqueue(data, headers)
 
-class MetricTransaction(Transaction):
+
+class AgentTransaction(Transaction):
 
     _application = None
     _trManager = None
     _endpoints = []
     _emitter_manager = None
+    _type = None
 
     @classmethod
     def set_application(cls, app):
@@ -149,17 +155,13 @@ class MetricTransaction(Transaction):
     @classmethod
     def set_endpoints(cls):
 
-        if 'use_pup' in cls._application._agentConfig:
-            if cls._application._agentConfig['use_pup']:
-                cls._endpoints.append(PUP_ENDPOINT)
         # Only send data to Datadog if an API KEY exists
         # i.e. user is also Datadog user
         try:
             is_dd_user = 'api_key' in cls._application._agentConfig\
                 and 'use_dd' in cls._application._agentConfig\
                 and cls._application._agentConfig['use_dd']\
-                and cls._application._agentConfig.get('api_key') is not None\
-                and cls._application._agentConfig.get('api_key', "pup") not in ("", "pup")
+                and cls._application._agentConfig.get('api_key')
             if is_dd_user:
                 log.warn("You are a Datadog user so we will send data to https://app.datadoghq.com")
                 cls._endpoints.append(DD_ENDPOINT)
@@ -169,6 +171,7 @@ class MetricTransaction(Transaction):
     def __init__(self, data, headers):
         self._data = data
         self._headers = headers
+        self._headers['DD-Forwarder-Version'] = get_version()
 
         # Call after data has been set (size is computed in Transaction's init)
         Transaction.__init__(self)
@@ -185,16 +188,10 @@ class MetricTransaction(Transaction):
     def __sizeof__(self):
         return sys.getsizeof(self._data)
 
-    def get_url(self, endpoint):
-        api_key = self._application._agentConfig.get('api_key')
-        if api_key:
-            return self._application._agentConfig[endpoint] + '/intake?api_key=%s' % api_key
-        return self._application._agentConfig[endpoint] + '/intake'
-
     def flush(self):
         for endpoint in self._endpoints:
             url = self.get_url(endpoint)
-            log.debug("Sending metrics to endpoint %s at %s" % (endpoint, url))
+            log.debug("Sending %s to endpoint %s at %s" % (self._type, endpoint, url))
 
             # Getting proxy settings
             proxy_settings = self._application._agentConfig.get('proxy_settings', None)
@@ -207,17 +204,18 @@ class MetricTransaction(Transaction):
                 'validate_cert': not self._application.skip_ssl_validation,
             }
 
+            # Remove headers that were passed by the emitter. Those don't apply anymore
+            # This is pretty hacky though as it should be done in pycurl or curl or tornado
+            for h in HEADERS_TO_REMOVE:
+                if h in tornado_client_params['headers']:
+                    del tornado_client_params['headers'][h]
+                    log.debug("Removing {0} header.".format(h))
+
             force_use_curl = False
 
-            if proxy_settings is not None and endpoint != PUP_ENDPOINT:
+            if proxy_settings is not None:
                 force_use_curl = True
                 if pycurl is not None:
-                    # When using a proxy we do a CONNECT request why shouldn't include Content-Length
-                    # This is pretty hacky though as it should be done in pycurl or curl or tornado
-                    if 'Content-Length' in tornado_client_params['headers']:
-                        del tornado_client_params['headers']['Content-Length']
-                        log.debug("Removing Content-Length header.")
-
                     log.debug("Configuring tornado to use proxy settings: %s:****@%s:%s" % (proxy_settings['user'],
                         proxy_settings['host'], proxy_settings['port']))
                     tornado_client_params['proxy_host'] = proxy_settings['host']
@@ -228,14 +226,14 @@ class MetricTransaction(Transaction):
                     if self._application._agentConfig.get('proxy_forbid_method_switch'):
                         # See http://stackoverflow.com/questions/8156073/curl-violate-rfc-2616-10-3-2-and-switch-from-post-to-get
                         tornado_client_params['prepare_curl_callback'] = lambda curl: curl.setopt(pycurl.POSTREDIR, pycurl.REDIR_POST_ALL)
-                
+
             if (not self._application.use_simple_http_client or force_use_curl) and pycurl is not None:
                 ssl_certificate = self._application._agentConfig.get('ssl_certificate', None)
                 tornado_client_params['ca_certs'] = ssl_certificate
 
             req = tornado.httpclient.HTTPRequest(**tornado_client_params)
             use_curl = force_use_curl or self._application._agentConfig.get("use_curl_http_client") and not self._application.use_simple_http_client
-            
+
             if use_curl:
                 if pycurl is None:
                     log.error("dd-agent is configured to use the Curl HTTP Client, but pycurl is not available on this system.")
@@ -245,16 +243,7 @@ class MetricTransaction(Transaction):
             else:
                 log.debug("Using SimpleHTTPClient")
             http = tornado.httpclient.AsyncHTTPClient()
-
-
-            # The success of this metric transaction should only depend on
-            # whether or not it's successfully sent to datadoghq. If it fails
-            # getting sent to pup, it's not a big deal.
-            callback = lambda(x): None
-            if len(self._endpoints) <= 1 or endpoint == DD_ENDPOINT:
-                callback = self.on_response
-
-            http.fetch(req, callback=callback)
+            http.fetch(req, callback=self.on_response)
 
     def on_response(self, response):
         if response.error:
@@ -266,18 +255,39 @@ class MetricTransaction(Transaction):
         self._trManager.flush_next()
 
 
+class MetricTransaction(AgentTransaction):
+    _type = "metrics"
+
+    def get_url(self, endpoint):
+        endpoint_base_url = get_url_endpoint(self._application._agentConfig[endpoint])
+        api_key = self._application._agentConfig.get('api_key')
+        if api_key:
+            return endpoint_base_url + '/intake?api_key=%s' % api_key
+        return endpoint_base_url + '/intake'
+
+
 class APIMetricTransaction(MetricTransaction):
 
     def get_url(self, endpoint):
+        endpoint_base_url = get_url_endpoint(self._application._agentConfig[endpoint])
         config = self._application._agentConfig
         api_key = config['api_key']
-        url = config[endpoint] + '/api/v1/series/?api_key=' + api_key
-        if endpoint == PUP_ENDPOINT:
-            url = config[endpoint] + '/api/v1/series'
+        url = endpoint_base_url + '/api/v1/series/?api_key=' + api_key
         return url
 
     def get_data(self):
         return self._data
+
+
+class APIServiceCheckTransaction(AgentTransaction):
+    _type = "service checks"
+
+    def get_url(self, endpoint):
+        endpoint_base_url = get_url_endpoint(self._application._agentConfig[endpoint])
+        config = self._application._agentConfig
+        api_key = config['api_key']
+        url = endpoint_base_url + '/api/v1/check_run/?api_key=' + api_key
+        return url
 
 
 class StatusHandler(tornado.web.RequestHandler):
@@ -298,6 +308,7 @@ class StatusHandler(tornado.web.RequestHandler):
             if len(transactions) > threshold:
                 self.set_status(503)
 
+
 class AgentInputHandler(tornado.web.RequestHandler):
 
     def post(self):
@@ -315,6 +326,7 @@ class AgentInputHandler(tornado.web.RequestHandler):
 
         self.write("Transaction: %s" % tr.get_id())
 
+
 class ApiInputHandler(tornado.web.RequestHandler):
 
     def post(self):
@@ -331,17 +343,35 @@ class ApiInputHandler(tornado.web.RequestHandler):
             raise tornado.web.HTTPError(500)
 
 
+class ApiCheckRunHandler(tornado.web.RequestHandler):
+    """
+    Handler to submit Service Checks
+    """
+    def post(self):
+        # read message
+        msg = self.request.body
+        headers = self.request.headers
+
+        if msg is not None:
+            # Setup a transaction for this message
+            tr = APIServiceCheckTransaction(msg, headers)
+        else:
+            raise tornado.web.HTTPError(500)
+
+        self.write("Transaction: %s" % tr.get_id())
+
+
 class Application(tornado.web.Application):
 
     def __init__(self, port, agentConfig, watchdog=True, skip_ssl_validation=False, use_simple_http_client=False):
         self._port = int(port)
         self._agentConfig = agentConfig
         self._metrics = {}
-        MetricTransaction.set_application(self)
-        MetricTransaction.set_endpoints()
+        AgentTransaction.set_application(self)
+        AgentTransaction.set_endpoints()
         self._tr_manager = TransactionManager(MAX_WAIT_FOR_REPLAY,
             MAX_QUEUE_SIZE, THROTTLING_DELAY)
-        MetricTransaction.set_tr_manager(self._tr_manager)
+        AgentTransaction.set_tr_manager(self._tr_manager)
 
         self._watchdog = None
         self.skip_ssl_validation = skip_ssl_validation or agentConfig.get('skip_ssl_validation', False)
@@ -395,6 +425,7 @@ class Application(tornado.web.Application):
         handlers = [
             (r"/intake/?", AgentInputHandler),
             (r"/api/v1/series/?", ApiInputHandler),
+            (r"/api/v1/check_run/?", ApiCheckRunHandler),
             (r"/status/?", StatusHandler),
         ]
 
@@ -512,6 +543,8 @@ def main():
         app = init(skip_ssl_validation, use_simple_http_client=use_simple_http_client)
         try:
             app.run()
+        except Exception:
+            log.exception("Uncaught exception in the forwarder")
         finally:
             ForwarderStatus.remove_latest_status()
 

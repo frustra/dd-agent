@@ -82,7 +82,7 @@ class Network(AgentCheck):
             self._check_solaris(instance)
 
     def _submit_devicemetrics(self, iface, vals_by_metric):
-        if self._exclude_iface_re and self._exclude_iface_re.match(iface):
+        if iface in self._excluded_ifaces or (self._exclude_iface_re and self._exclude_iface_re.match(iface)):
             # Skip this network interface.
             return False
 
@@ -98,26 +98,11 @@ class Network(AgentCheck):
             assert m in vals_by_metric
         assert len(vals_by_metric) == len(expected_metrics)
 
-        # For reasons i don't understand only these metrics are skipped if a
-        # particular interface is in the `excluded_interfaces` config list.
-        # Not sure why the others aren't included. Until I understand why, I'm
-        # going to keep the same behaviour.
-        exclude_iface_metrics = [
-            'packets_in.count',
-            'packets_in.error',
-            'packets_out.count',
-            'packets_out.error',
-        ]
-
         count = 0
         for metric, val in vals_by_metric.iteritems():
-            if iface in self._excluded_ifaces and metric in exclude_iface_metrics:
-                # skip it!
-                continue
             self.rate('system.net.%s' % metric, val, device_name=iface)
             count += 1
         self.log.debug("tracked %s network metrics for interface %s" % (count, iface))
-
 
     def _parse_value(self, v):
         if v == "-":
@@ -198,45 +183,55 @@ class Network(AgentCheck):
                 }
                 self._submit_devicemetrics(iface, metrics)
 
-
-        proc = open('/proc/net/snmp', 'r')
-        # IP:      Forwarding   DefaultTTL InReceives     InHdrErrors  ...
-        # IP:      2            64         377145470      0            ...
-        # Icmp:    InMsgs       InErrors   InDestUnreachs InTimeExcds  ...
-        # Icmp:    1644495      1238       1643257        0            ...
-        # IcmpMsg: InType3      OutType3
-        # IcmpMsg: 1643257      1643257
-        # Tcp:     RtoAlgorithm RtoMin     RtoMax         MaxConn      ...
-        # Tcp:     1            200        120000         -1           ...
-        # Udp:     InDatagrams  NoPorts    InErrors       OutDatagrams ...
-        # Udp:     24249494     1643257    0              25892947     ...
-        # UdpLite: InDatagrams  Noports    InErrors       OutDatagrams ...
-        # UdpLite: 0            0          0              0            ...
         try:
-            lines = proc.readlines()
-        finally:
-            proc.close()
+            proc = open('/proc/net/snmp', 'r')
 
-        tcp_lines = [line for line in lines if line.startswith('Tcp:')]
-        column_names = tcp_lines[0].strip().split()
-        values = tcp_lines[1].strip().split()
+            # IP:      Forwarding   DefaultTTL InReceives     InHdrErrors  ...
+            # IP:      2            64         377145470      0            ...
+            # Icmp:    InMsgs       InErrors   InDestUnreachs InTimeExcds  ...
+            # Icmp:    1644495      1238       1643257        0            ...
+            # IcmpMsg: InType3      OutType3
+            # IcmpMsg: 1643257      1643257
+            # Tcp:     RtoAlgorithm RtoMin     RtoMax         MaxConn      ...
+            # Tcp:     1            200        120000         -1           ...
+            # Udp:     InDatagrams  NoPorts    InErrors       OutDatagrams ...
+            # Udp:     24249494     1643257    0              25892947     ...
+            # UdpLite: InDatagrams  Noports    InErrors       OutDatagrams ...
+            # UdpLite: 0            0          0              0            ...
+            try:
+                lines = proc.readlines()
+            finally:
+                proc.close()
 
-        tcp_metrics = dict(zip(column_names,values))
+            tcp_lines = [line for line in lines if line.startswith('Tcp:')]
+            column_names = tcp_lines[0].strip().split()
+            values = tcp_lines[1].strip().split()
 
-        # line start indicating what kind of metrics we're looking at
-        assert(tcp_metrics['Tcp:']=='Tcp:')
+            tcp_metrics = dict(zip(column_names,values))
 
-        tcp_metrics_name = {
-            'RetransSegs': 'system.net.tcp.retrans_segs',
-            'InSegs'     : 'system.net.tcp.in_segs',
-            'OutSegs'    : 'system.net.tcp.out_segs'
-            }
+            # line start indicating what kind of metrics we're looking at
+            assert(tcp_metrics['Tcp:']=='Tcp:')
 
-        for key, metric in tcp_metrics_name.iteritems():
-            self.rate(metric, self._parse_value(tcp_metrics[key]))
+            tcp_metrics_name = {
+                'RetransSegs': 'system.net.tcp.retrans_segs',
+                'InSegs'     : 'system.net.tcp.in_segs',
+                'OutSegs'    : 'system.net.tcp.out_segs'
+                }
+
+            for key, metric in tcp_metrics_name.iteritems():
+                self.rate(metric, self._parse_value(tcp_metrics[key]))
+        except IOError:
+            # On Openshift, /proc/net/snmp is only readable by root
+            self.log.debug("Unable to read /proc/net/snmp.")
 
     def _check_bsd(self, instance):
-        netstat = subprocess.Popen(["netstat", "-i", "-b"],
+        netstat_flags = ['-i', '-b']
+
+        # FreeBSD's netstat truncates device names unless you pass '-W'
+        if Platform.is_freebsd():
+            netstat_flags.append('-W')
+
+        netstat = subprocess.Popen(["netstat"] + netstat_flags,
                                    stdout=subprocess.PIPE,
                                    close_fds=True).communicate()[0]
         # Name  Mtu   Network       Address            Ipkts Ierrs     Ibytes    Opkts Oerrs     Obytes  Coll

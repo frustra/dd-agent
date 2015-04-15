@@ -12,7 +12,7 @@ profile=no
 
 # Add files or directories to the blacklist. They should be base names, not
 # paths.
-ignore=CVS,.git
+ignore=CVS,.git,embedded,venv
 
 # Pickle collected data for later comparisons.
 persistent=yes
@@ -40,7 +40,7 @@ load-plugins=
 # --disable=W"
 #disable=
 #
-disable=W,C,R,maybe-no-member,no-member
+disable=W,C,R,maybe-no-member,no-member,I0011
 # FIXME matt: pylint has a bug that will not let you gradually enable
 # rules in the rcfile, so this is done in our rakefile.
 # http://www.logilab.org/ticket/36584
@@ -245,7 +245,7 @@ max-public-methods=20
 [IMPORTS]
 
 # Deprecated modules which should not be used, separated by a comma
-deprecated-modules=regsub,string,TERMIOS,Bastion,rexec,json
+deprecated-modules=regsub,string,TERMIOS,Bastion,rexec,json,Check
 
 # Create a graph of every (i.e. internal and external) dependencies in the
 # given file (report RP0402 must not be disabled)

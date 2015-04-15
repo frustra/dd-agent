@@ -1,12 +1,25 @@
+import logging
+import os
 import time
 import unittest
-import logging
-logger = logging.getLogger()
-from checks import (Check, AgentCheck,
-    CheckException, UnknownValue, CheckException, Infinity)
-from checks.collector import Collector
+
+from nose.plugins.attrib import attr
+from nose.plugins.skip import SkipTest
+
 from aggregator import MetricsAggregator
-from common import load_check
+from checks import (
+    AgentCheck,
+    Check,
+    CheckException,
+    CheckException,
+    Infinity,
+    UnknownValue,
+)
+from checks.collector import Collector
+from tests.common import load_check
+from util import get_hostname
+
+logger = logging.getLogger()
 
 class TestCore(unittest.TestCase):
     "Tests to validate the core check logic"
@@ -17,7 +30,7 @@ class TestCore(unittest.TestCase):
         self.c.counter("test-counter")
 
     def setUpAgentCheck(self):
-        self.ac = AgentCheck('test', {}, {})
+        self.ac = AgentCheck('test', {}, {'checksd_hostname': "foo"})
 
     def test_gauge(self):
         self.assertEquals(self.c.is_gauge("test-metric"), True)
@@ -106,7 +119,7 @@ class TestCore(unittest.TestCase):
         self.assertEqual(self.ac.normalize("Metric.wordThatShouldBeSeparated", "prefix", fix_case = True), "prefix.metric.word_that_should_be_separated")
 
     def test_metadata(self):
-        c = Collector({"collect_instance_metadata": True}, None, {})
+        c = Collector({"collect_instance_metadata": True}, None, {}, "foo")
         assert "hostname" in c._get_metadata()
         assert "socket-fqdn" in c._get_metadata()
         assert "socket-hostname" in c._get_metadata()
@@ -118,7 +131,7 @@ class TestCore(unittest.TestCase):
         host_name = 'foohost'
         timestamp = time.time()
 
-        check = AgentCheck('test', {}, {})
+        check = AgentCheck('test', {}, {'checksd_hostname':'foo'})
         check.service_check(check_name, status, tags, timestamp, host_name)
         self.assertEquals(len(check.service_checks), 1, check.service_checks)
         val = check.get_service_checks()
@@ -136,6 +149,7 @@ class TestCore(unittest.TestCase):
                 }], val)
         self.assertEquals(len(check.service_checks), 0, check.service_checks)
 
+    @attr(requires='sysstat')
     def test_collector(self):
         agentConfig = {
             'api_key': 'test_apikey',
@@ -153,7 +167,7 @@ class TestCore(unittest.TestCase):
         }
         checks = [load_check('redisdb', redis_config, agentConfig)]
 
-        c = Collector(agentConfig, [], {})
+        c = Collector(agentConfig, [], {}, get_hostname(agentConfig))
         payload = c.run({
             'initialized_checks': checks,
             'init_failed_checks': {}
@@ -170,9 +184,47 @@ class TestCore(unittest.TestCase):
             tag = "check:%s" % check.name
             assert tag in all_tags, all_tags
 
-    def test_min_collection_interval(self):
+    def test_no_proxy(self):
+        """ Starting with Agent 5.0.0, there should always be a local forwarder
+        running and all payloads should go through it. So we should make sure
+        that we pass the no_proxy environment variable that will be used by requests
+        (See: https://github.com/kennethreitz/requests/pull/945 )
+        """
+        from requests.utils import get_environ_proxies
+        import dogstatsd
+        from os import environ as env
+        
+        env["http_proxy"] = "http://localhost:3128"
+        env["https_proxy"] = env["http_proxy"]
+        env["HTTP_PROXY"] = env["http_proxy"]
+        env["HTTPS_PROXY"] = env["http_proxy"]
 
-        config = {'instances': [{'foo': 'bar'}], 'init_config': {}}
+        self.assertTrue("no_proxy" in env)
+
+        self.assertEquals(env["no_proxy"], "127.0.0.1,localhost")
+        self.assertEquals({}, get_environ_proxies(
+            "http://localhost:17123/intake"))
+
+        expected_proxies = {
+            'http': 'http://localhost:3128',
+            'https': 'http://localhost:3128',
+            'no': '127.0.0.1,localhost'
+        }
+        environ_proxies = get_environ_proxies("https://www.google.com")
+        self.assertEquals(expected_proxies, environ_proxies,
+            (expected_proxies, environ_proxies))
+
+        # Clear the env variables set
+        del env["http_proxy"]
+        del env["https_proxy"]
+        del env["HTTP_PROXY"]
+        del env["HTTPS_PROXY"]
+
+
+    def test_min_collection_interval(self):
+        if os.environ.get('TRAVIS', False):
+            raise SkipTest('ntp server times out too often on Travis')
+        config = {'instances': [{'host': '0.amazon.pool.ntp.org', 'timeout': 1}], 'init_config': {}}
 
         agentConfig = {
             'version': '0.1',
@@ -185,17 +237,18 @@ class TestCore(unittest.TestCase):
         check.run()
         metrics = check.get_metrics()
         self.assertTrue(len(metrics) > 0, metrics)
-        
+
         check.run()
         metrics = check.get_metrics()
         # No metrics should be collected as it's too early
         self.assertEquals(len(metrics), 0, metrics)
 
-        time.sleep(20)
+        # equivalent to time.sleep(20)
+        check.last_collection_time[0] -= 20
         check.run()
         metrics = check.get_metrics()
         self.assertTrue(len(metrics) > 0, metrics)
-        time.sleep(3)
+        check.last_collection_time[0] -= 3
         check.run()
         metrics = check.get_metrics()
         self.assertEquals(len(metrics), 0, metrics)
@@ -204,7 +257,7 @@ class TestCore(unittest.TestCase):
         metrics = check.get_metrics()
         self.assertTrue(len(metrics) > 0, metrics)
 
-        config = {'instances': [{'foo': 'bar', 'min_collection_interval':3}], 'init_config': {}}
+        config = {'instances': [{'host': '0.amazon.pool.ntp.org', 'timeout': 1, 'min_collection_interval':3}], 'init_config': {}}
         check = load_check('ntp', config, agentConfig)
         check.run()
         metrics = check.get_metrics()
@@ -212,12 +265,12 @@ class TestCore(unittest.TestCase):
         check.run()
         metrics = check.get_metrics()
         self.assertEquals(len(metrics), 0, metrics)
-        time.sleep(4)
+        check.last_collection_time[0] -= 4
         check.run()
         metrics = check.get_metrics()
         self.assertTrue(len(metrics) > 0, metrics)
 
-        config = {'instances': [{'foo': 'bar', 'min_collection_interval': 12}], 'init_config': { 'min_collection_interval':3}}
+        config = {'instances': [{'host': '0.amazon.pool.ntp.org', 'timeout': 1, 'min_collection_interval': 12}], 'init_config': { 'min_collection_interval':3}}
         check = load_check('ntp', config, agentConfig)
         check.run()
         metrics = check.get_metrics()
@@ -225,11 +278,11 @@ class TestCore(unittest.TestCase):
         check.run()
         metrics = check.get_metrics()
         self.assertEquals(len(metrics), 0, metrics)
-        time.sleep(4)
+        check.last_collection_time[0] -= 4
         check.run()
         metrics = check.get_metrics()
         self.assertEquals(len(metrics), 0, metrics)
-        time.sleep(8)
+        check.last_collection_time[0] -= 8
         check.run()
         metrics = check.get_metrics()
         self.assertTrue(len(metrics) > 0, metrics)

@@ -1,91 +1,94 @@
-import unittest
-from StringIO import StringIO
-from tests.common import get_check
+# stdlib
+from nose.plugins.attrib import attr
 
-CONFIG = """
-init_config:
+# project
+from checks import AgentCheck
+from tests.common import AgentCheckTest
 
-instances:
-    - host: 127.0.0.1
-      port: 2181
-      tags: []
-"""
 
-class TestZookeeper(unittest.TestCase):
-    def test_zk_stat_parsing_lt_v344(self):
-        Zookeeper, instances = get_check('zk', CONFIG)
-        stat_response = """Zookeeper version: 3.2.2--1, built on 03/16/2010 07:31 GMT
-Clients:
- /10.42.114.160:32634[1](queued=0,recved=12,sent=0)
- /10.37.137.74:21873[1](queued=0,recved=53613,sent=0)
- /10.37.137.74:21876[1](queued=0,recved=57436,sent=0)
- /10.115.77.32:32990[1](queued=0,recved=16,sent=0)
- /10.37.137.74:21891[1](queued=0,recved=55011,sent=0)
- /10.37.137.74:21797[1](queued=0,recved=19431,sent=0)
+@attr(requires='zookeeper')
+class ZooKeeperTestCase(AgentCheckTest):
+    CHECK_NAME = 'zk'
 
-Latency min/avg/max: -10/0/20007
-Received: 101032173
-Sent: 0
-Outstanding: 0
-Zxid: 0x1034799c7
-Mode: leader
-Node count: 487
-"""
-        expected = [
-            ('zookeeper.latency.min',              -10),
-            ('zookeeper.latency.avg',                0),
-            ('zookeeper.latency.max',            20007),
-            ('zookeeper.bytes_received',    101032173L),
-            ('zookeeper.bytes_sent',                0L),
-            ('zookeeper.connections',                6),
-            ('zookeeper.bytes_outstanding',         0L),
-            ('zookeeper.zxid.epoch',                 1),
-            ('zookeeper.zxid.count',          55024071),
-            ('zookeeper.nodes',                    487L),
-        ]
+    CONFIG = {
+        'host': "127.0.0.1",
+        'port': 2181,
+        'expected_mode': "standalone",
+        'tags': ["mytag"]
+    }
 
-        buf = StringIO(stat_response)
-        metrics, tags = Zookeeper.parse_stat(buf)
+    WRONG_EXPECTED_MODE = {
+        'host': "127.0.0.1",
+        'port': 2181,
+        'expected_mode': "follower",
+        'tags': []
+    }
 
-        self.assertEquals(tags, ['mode:leader'])
-        self.assertEquals(metrics, expected)
+    CONNECTION_FAILURE_CONFIG = {
+        'host': "127.0.0.1",
+        'port': 2182,
+        'expected_mode': "follower",
+        'tags': []
+    }
 
-    def test_zk_stat_parsing_gte_v344(self):
-        Zookeeper, instances = get_check('zk', CONFIG)
-        stat_response = """Zookeeper version: 3.4.5--1, built on 03/16/2010 07:31 GMT
-Clients:
- /10.42.114.160:32634[1](queued=0,recved=12,sent=0)
- /10.37.137.74:21873[1](queued=0,recved=53613,sent=0)
- /10.37.137.74:21876[1](queued=0,recved=57436,sent=0)
- /10.115.77.32:32990[1](queued=0,recved=16,sent=0)
- /10.37.137.74:21891[1](queued=0,recved=55011,sent=0)
- /10.37.137.74:21797[1](queued=0,recved=19431,sent=0)
+    METRICS = [
+        'zookeeper.latency.min',
+        'zookeeper.latency.avg',
+        'zookeeper.latency.max',
+        'zookeeper.bytes_received',
+        'zookeeper.bytes_sent',
+        'zookeeper.connections',
+        'zookeeper.connections',
+        'zookeeper.bytes_outstanding',
+        'zookeeper.outstanding_requests',
+        'zookeeper.zxid.epoch',
+        'zookeeper.zxid.count',
+        'zookeeper.nodes',
+    ]
 
-Latency min/avg/max: -10/0/20007
-Received: 101032173
-Sent: 0
-Connections: 1
-Outstanding: 0
-Zxid: 0x1034799c7
-Mode: leader
-Node count: 487
-"""
-        expected = [
-            ('zookeeper.latency.min',              -10),
-            ('zookeeper.latency.avg',                0),
-            ('zookeeper.latency.max',            20007),
-            ('zookeeper.bytes_received',    101032173L),
-            ('zookeeper.bytes_sent',                0L),
-            ('zookeeper.connections',                1),
-            ('zookeeper.bytes_outstanding',         0L),
-            ('zookeeper.zxid.epoch',                 1),
-            ('zookeeper.zxid.count',          55024071),
-            ('zookeeper.nodes',                    487L),
-        ]
+    def test_check(self):
+        """
+        Collect ZooKeeper metrics.
+        """
+        config = {
+            'instances': [self.CONFIG]
+        }
+        self.run_check(config)
 
-        buf = StringIO(stat_response)
-        metrics, tags = Zookeeper.parse_stat(buf)
+        # Test metrics
+        for mname in self.METRICS:
+            self.assertMetric(mname, tags=["mode:standalone", "mytag"], count=1)
 
-        self.assertEquals(tags, ['mode:leader'])
-        self.assertEquals(metrics, expected)
+        # Test service checks
+        self.assertServiceCheck("zookeeper.ruok", status=AgentCheck.OK)
+        self.assertServiceCheck("zookeeper.mode", status=AgentCheck.OK)
 
+        self.coverage_report()
+
+    def test_wrong_expected_mode(self):
+        """
+        Raise a 'critical' service check when ZooKeeper is not in the expected mode
+        """
+        config = {
+            'instances': [self.WRONG_EXPECTED_MODE]
+        }
+        self.run_check(config)
+
+        # Test service checks
+        self.assertServiceCheck("zookeeper.mode", status=AgentCheck.CRITICAL)
+
+    def test_error_state(self):
+        """
+        Raise a 'critical' service check when ZooKeeper is in an error state
+        """
+        config = {
+            'instances': [self.CONNECTION_FAILURE_CONFIG]
+        }
+
+        self.assertRaises(
+            Exception,
+            lambda: self.run_check(config)
+        )
+
+        # Test service checks
+        self.assertServiceCheck("zookeeper.ruok", status=AgentCheck.CRITICAL)

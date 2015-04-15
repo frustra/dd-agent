@@ -7,6 +7,7 @@ from checks import AgentCheck
 # 3rd party
 import wmi
 
+
 class IIS(AgentCheck):
     METRICS = [
         ('iis.uptime', 'gauge', 'ServiceUptime'),
@@ -41,9 +42,10 @@ class IIS(AgentCheck):
         ('iis.requests.cgi', 'rate', 'TotalCGIRequests'),
         ('iis.requests.isapi', 'rate', 'TotalISAPIExtensionRequests'),
     ]
+    SERVICE_CHECK = "iis.site_up"
 
-    def __init__(self, name, init_config, agentConfig):
-        AgentCheck.__init__(self, name, init_config, agentConfig)
+    def __init__(self, name, init_config, agentConfig, instances):
+        AgentCheck.__init__(self, name, init_config, agentConfig, instances)
         self.wmi_conns = {}
 
     def _get_wmi_conn(self, host, user, password):
@@ -69,6 +71,7 @@ class IIS(AgentCheck):
             self.log.exception('Unable to fetch Win32_PerfFormattedData_W3SVC_WebService class')
             return
 
+        expected_sites = set(sites)
         # Iterate over every IIS site
         for iis_site in wmi_cls:
             # Skip any sites we don't specifically want.
@@ -81,17 +84,31 @@ class IIS(AgentCheck):
             else:
                 tags = instance_tags
 
+            status = AgentCheck.CRITICAL if iis_site.ServiceUptime == 0 else AgentCheck.OK
+            self.service_check("iis.site_up", status, tags=['site:%s' % iis_site.Name])
+            expected_sites.remove(iis_site.Name)
+
             for metric, mtype, wmi_val in self.METRICS:
                 if not hasattr(iis_site, wmi_val):
-                    if wmi_val == 'TotalBytesTransferred' and hasattr(iis_site, 'TotalBytesTransfered'):
-                        # Windows 2008 sp2 reports it as TotalbytesTransfered instead of TotalBytesTransferred (single r)
+                    if wmi_val == 'TotalBytesTransferred' and hasattr(iis_site,
+                                                                      'TotalBytesTransfered'):
+                        # Windows 2008 sp2 reports it as TotalbytesTransfered
+                        # instead of TotalBytesTransferred (single r)
                         wmi_val = 'TotalBytesTransfered'
+                    elif wmi_val == 'TotalConnectionAttemptsAllInstances' \
+                            and hasattr(iis_site, 'TotalConnectionAttemptsallinstances'):
+                        wmi_val = 'TotalConnectionAttemptsallinstances'
                     else:
-                        self.warning('Unable to fetch metric %s. Missing %s in Win32_PerfFormattedData_W3SVC_WebService' \
-                            % (metric, wmi_val))
+                        self.warning("Unable to fetch metric %s. Missing %s in "
+                                     "Win32_PerfFormattedData_W3SVC_WebService"
+                                     % (metric, wmi_val))
                         continue
 
                 # Submit the metric value with the correct type
                 value = float(getattr(iis_site, wmi_val))
                 metric_func = getattr(self, mtype)
                 metric_func(metric, value, tags=tags)
+
+        for remaining_site in expected_sites:
+            self.service_check("iis.site_up", AgentCheck.CRITICAL,
+                               tags=['site:%s' % remaining_site])
